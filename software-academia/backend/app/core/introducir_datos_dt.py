@@ -17,11 +17,11 @@ CSV_ATTENDANCE = r"C:/Users/Windows/Downloads/synthetic_attendance.csv"
 CSV_EMAILS     = r"C:/Users/Windows/Downloads/synthetic_emails.csv"
 CSV_CHURN      = r"C:/Users/Windows/Downloads/churn_training_unified.csv"
 
-# Credenciales MySQL (las que usaste en tu REPL)
-MYSQL_HOST = "mysql-senu-jhonnybarrios968.b.aivencloud.com"
-MYSQL_USER = "avnadmin"
-MYSQL_PASS = "***REDACTED***"
-MYSQL_PORT = 15797
+MYSQL_HOST = os.getenv("DB_HOST")
+MYSQL_USER = os.getenv("DB_USER")
+MYSQL_PASS = os.getenv("DB_PASSWORD")
+MYSQL_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_NAME    = os.getenv("DB_NAME")
 # ==================================================
 
 def qi(name: str) -> str:
