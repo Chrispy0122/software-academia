@@ -105,6 +105,76 @@ def get_transformed_feature_names(
     return feature_names
 
 
+def robust_feature_names_from_preproc(
+    preproc: ColumnTransformer,
+    input_cols: list[str]
+) -> list[str]:
+    """
+    Nombres legibles y completos para TODAS las columnas transformadas,
+    usando las columnas de entrada ACTUALES (input_cols) para calcular el remainder.
+    - OneHotEncoder -> "col=cat"
+    - passthrough   -> nombre original
+    - otros         -> nombre de columna (1:1)
+    """
+    # 1) Intento directo (si está fitted y soportado)
+    try:
+        names = list(preproc.get_feature_names_out())
+        if names:
+            return names
+    except Exception:
+        pass
+
+    names: list[str] = []
+
+    def last_step(transformer):
+        if isinstance(transformer, Pipeline) and transformer.steps:
+            return transformer.steps[-1][1]
+        return transformer
+
+    assigned_cols = set()
+
+    # 2) Construcción manual para transformadores explícitos
+    for name, trans, cols in preproc.transformers_:
+        if name == "remainder":
+            continue
+        cols = list(cols) if isinstance(cols, (list, tuple)) else [cols]
+        t = last_step(trans)
+        assigned_cols.update(cols)
+
+        if isinstance(t, OneHotEncoder):
+            cats = t.categories_
+            for col, cat_values in zip(cols, cats):
+                for cat in cat_values:
+                    names.append(f"{col}={cat}")
+        elif t == "passthrough":
+            names.extend(cols)
+        elif t == "drop":
+            # no agrega columnas
+            continue
+        else:
+            # StandardScaler y similares (1:1 por columna)
+            names.extend(cols)
+
+    # 3) Remainder basado en las columnas ACTUALES (input_cols)
+    #    No uses feature_names_in_ aquí: usa input_cols para evitar desajustes.
+    try:
+        # Si el remainder es passthrough, añadimos todas las columnas
+        # de input_cols que no hayan sido asignadas arriba.
+        for name, trans, cols in preproc.transformers_:
+            if name == "remainder" and trans == "passthrough":
+                remainder_cols = [c for c in input_cols if c not in assigned_cols]
+                names.extend(remainder_cols)
+                break
+    except Exception:
+        pass
+
+    # Último recurso si no obtuvimos nada
+    if not names:
+        names = list(input_cols)
+
+    return names
+
+
 def build_background_matrix(session, asof_date: str, sample_size: int = 300):
     preproc, est = get_preprocessor_and_estimator(_pipe)
     if preproc is None:
@@ -139,7 +209,15 @@ def build_background_matrix(session, asof_date: str, sample_size: int = 300):
     if hasattr(X_bg_trans, "toarray"):
         X_bg_trans = X_bg_trans.toarray()
 
-    transformed_names = get_transformed_feature_names(preproc, _cat_cols, _num_cols)
+    # input_cols son las columnas REALES que entraron al preproc hoy
+    input_cols = list(X_bg.columns)
+    transformed_names = robust_feature_names_from_preproc(preproc, input_cols)
+    if len(transformed_names) != X_bg_trans.shape[1]:
+    # Como diagnóstico temporal, imprime para ver la discrepancia:
+    # print("len(transformed_names)=", len(transformed_names), " X_bg_trans.shape[1]=", X_bg_trans.shape[1])
+        transformed_names = [f"feat_{i}" for i in range(X_bg_trans.shape[1])]
+
+
 
     # Asegurar longitud exacta
     if len(transformed_names) != X_bg_trans.shape[1]:
@@ -154,8 +232,14 @@ def build_background_matrix(session, asof_date: str, sample_size: int = 300):
 
     return X_bg, X_bg_trans, transformed_names
 
+def explain_student(session, student_id: int, asof_date: str | None = None, top_k: int = 5):
+    import numpy as np
+    import pandas as pd
+    import shap
+    from sklearn.preprocessing import OneHotEncoder
+    from sklearn.pipeline import Pipeline
+    from sklearn.compose import ColumnTransformer
 
-def explain_student(session, student_id: int, asof_date: str | None = None, top_k: int = None):
     if asof_date is None:
         asof_date = infer_asof_date(session)
 
@@ -163,10 +247,71 @@ def explain_student(session, student_id: int, asof_date: str | None = None, top_
     if preproc is None:
         raise RuntimeError("No se encontró preprocesador en el pipeline")
 
-    # Background (informa sobre categorías OHE) y nombres "buenos"
-    X_bg, X_bg_trans, transformed_names_bg = build_background_matrix(session, asof_date, sample_size=300)
+    # ---------- Helpers internos ----------
+    def _last_step(transformer):
+        if isinstance(transformer, Pipeline) and transformer.steps:
+            return transformer.steps[-1][1]
+        return transformer
 
-    # Features del alumno
+    def _orig_index_map(preproc: ColumnTransformer, input_cols: list[str]) -> list[str]:
+        """
+        Devuelve una lista de largo = n_cols_transformadas donde cada posición i
+        indica el NOMBRE DE LA VARIABLE ORIGINAL que generó esa columna transformada.
+        No depende de nombres del OHE; calcula longitudes por transformador.
+        Soporta:
+          - OneHotEncoder (respeta drop_idx_)
+          - Passthrough / Drop
+          - Otros (Scaler/Imputer...) 1:1
+          - remainder='passthrough' (usa input_cols reales)
+        """
+        orig_names_by_pos: list[str] = []
+        assigned = set()
+
+        # Transformadores explícitos
+        for name, trans, cols in preproc.transformers_:
+            if name == "remainder":
+                continue
+            cols = list(cols) if isinstance(cols, (list, tuple)) else [cols]
+            t = _last_step(trans)
+            assigned.update(cols)
+
+            if isinstance(t, OneHotEncoder):
+                # Para cada columna categórica, el OHE produce (#categorías - drops) columnas
+                cats_list = t.categories_
+                drop_idx = getattr(t, "drop_idx_", None)  # None o lista/array por columna
+                for i, col in enumerate(cols):
+                    n_cats = len(cats_list[i])
+                    dropped = set()
+                    if drop_idx is not None:
+                        di = drop_idx[i] if i < len(np.atleast_1d(drop_idx)) else None
+                        if di is not None:
+                            arr = np.atleast_1d(di)
+                            dropped = set(int(x) for x in arr.tolist())
+                    out_dim = n_cats - len(dropped)
+                    orig_names_by_pos.extend([col] * out_dim)
+            else:
+                # passthrough: 1:1 por columna
+                if t == "passthrough":
+                    orig_names_by_pos.extend(cols)
+                elif t == "drop":
+                    continue
+                else:
+                    # Scaler/Imputer/etc. normalmente 1:1
+                    orig_names_by_pos.extend(cols)
+
+        # Remainder contra input_cols REALES
+        for name, trans, cols in preproc.transformers_:
+            if name == "remainder" and trans == "passthrough":
+                remainder_cols = [c for c in input_cols if c not in assigned]
+                orig_names_by_pos.extend(remainder_cols)
+                break
+
+        return orig_names_by_pos
+
+    # ---------- Background (opcional para consistencia con tu flujo) ----------
+    _ = build_background_matrix(session, asof_date, sample_size=300)
+
+    # ---------- Fila del alumno (espacio original) ----------
     feat = build_features_from_db_sqlmodel_session(session, asof_date)
     row = feat.loc[feat["Student_ID"] == student_id].copy()
     if row.empty:
@@ -176,11 +321,14 @@ def explain_student(session, student_id: int, asof_date: str | None = None, top_
     if "Student_ID" in X.columns and "Student_ID" not in _expected:
         X = X.drop(columns=["Student_ID"], errors="ignore")
 
+    # Alinear contrato
     for c in _expected:
         if c not in X.columns:
             X[c] = 0
     X = X[_expected].copy()
+    proba = float(_pipe.predict_proba(X)[:, 1][0])  # prob. de la clase “abandona”
 
+    # Tipos correctos
     for c in _cat_cols:
         if c in X.columns:
             X[c] = X[c].astype(str).fillna("<UNK>")
@@ -188,81 +336,94 @@ def explain_student(session, student_id: int, asof_date: str | None = None, top_
         if c in X.columns:
             X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0)
 
-    # Transformar fila objetivo
+    # ---------- Transformación (espacio transformado) ----------
     X_trans = preproc.transform(X)
     if hasattr(X_trans, "toarray"):
         X_trans = X_trans.toarray()
 
-    # Nombres transformados
-    transformed_names = get_transformed_feature_names(preproc, _cat_cols, _num_cols)
-    if len(transformed_names) != X_trans.shape[1]:
-        try:
-            names2 = preproc.get_feature_names_out().tolist()
-        except Exception:
-            names2 = None
-        if names2 is not None and len(names2) == X_trans.shape[1]:
-            transformed_names = names2
-        else:
-            transformed_names = [f"feat_{i}" for i in range(X_trans.shape[1])]
+    # ---------- Mapeo índice→variable original ----------
+    input_cols = list(X.columns)
+    orig_by_idx = _orig_index_map(preproc, input_cols)
 
-    # TreeExplainer SIN feature_names (evita validación interna de longitudes)
+    # Alinear longitudes del mapeo con X_trans
+    n_trans = X_trans.shape[1]
+    if len(orig_by_idx) != n_trans:
+        if len(orig_by_idx) > n_trans:
+            orig_by_idx = orig_by_idx[:n_trans]
+        else:
+            orig_by_idx = orig_by_idx + (["<unk>"] * (n_trans - len(orig_by_idx)))
+
+    # ---------- SHAP sobre el ESTIMADOR ----------
     explainer = shap.TreeExplainer(est)
     shap_values = explainer.shap_values(X_trans)
 
-    # Vector de la clase positiva (binario) o único vector (regresión)
-    if isinstance(shap_values, list) and len(shap_values) == 2:
-        sv = shap_values[1][0]
+    # Binario vs regresión
+    if isinstance(shap_values, list) and len(shap_values) >= 2:
+        sv = shap_values[1][0]  # clase positiva
     else:
         sv = shap_values[0] if np.ndim(shap_values) == 2 else shap_values
-
     sv = np.asarray(sv).ravel()
 
-    # Validación final
-    assert len(sv) == len(transformed_names), f"Len mismatch: sv={len(sv)} vs names={len(transformed_names)}"
+    # Seguridad: alinear longitudes
+    if len(sv) != len(orig_by_idx):
+        if len(sv) > len(orig_by_idx):
+            orig_by_idx = orig_by_idx + (["<unk>"] * (len(sv) - len(orig_by_idx)))
+        else:
+            sv = sv[:len(orig_by_idx)]
 
-    # Mapear dummies OHE a su feature original
-    def original_feature_name(trans_name: str) -> str:
-        for cat in _cat_cols:
-            prefix = f"{cat}_"
-            if trans_name.startswith(prefix):
-                return cat
-        return trans_name
-
+    # ---------- Agregar, LIMPIAR y agrupar por variable original ----------
     contrib = pd.DataFrame({
-        "transformed_feature": transformed_names,
+        "orig_feature": orig_by_idx,
         "shap_value": sv
     })
-    contrib["orig_feature"] = contrib["transformed_feature"].apply(original_feature_name)
     contrib["abs_val"] = contrib["shap_value"].abs()
 
+    # Limpieza: quita '<unk>' y ruido numérico
+    EPS = 1e-10
+    contrib = contrib[contrib["orig_feature"] != "<unk>"].copy()
+    contrib = contrib[contrib["abs_val"] > EPS].copy()
+
+    # Si quedó vacío (raro), reconstituir con nombres originales de input y sv (trunc/extend)
+    if contrib.empty:
+        # Empareja sv con input_cols (contrato original)
+        m = min(len(input_cols), len(sv))
+        contrib = pd.DataFrame({
+            "orig_feature": input_cols[:m],
+            "shap_value": sv[:m]
+        })
+        contrib["abs_val"] = contrib["shap_value"].abs()
+
     agg = (contrib.groupby("orig_feature", as_index=False)
-                  .agg(total_abs=("abs_val", "sum"))
+                  .agg(total_abs=("abs_val", "sum"),
+                       net=("shap_value", "sum"))
                   .sort_values("total_abs", ascending=False))
 
-    top_features = agg.head(top_k)["orig_feature"].tolist()
+    top_rows = agg.head(top_k)
 
     explanations = []
     row_values = X.iloc[0].to_dict()
-    for feat_name in top_features:
-        mask = contrib["orig_feature"] == feat_name
-        shap_net = contrib.loc[mask, "shap_value"].sum()
+    for _, r in top_rows.iterrows():
+        feat_name = r["orig_feature"]
+        shap_net = float(r["net"])
         direction = "sube_riesgo" if shap_net > 0 else "baja_riesgo"
         explanations.append({
             "feature": feat_name,
-            "impact": float(shap_net),
+            "impact": shap_net,
             "effect": direction,
             "value": row_values.get(feat_name, None)
         })
 
     return {
-        "student_id": student_id,
-        "asof_date": asof_date,
-        "top_k": top_k,
-        "reasons": explanations
-    }
+    "student_id": student_id,
+    "asof_date": asof_date,
+    "top_k": top_k,
+    "prob_churn": proba,     # <-- aquí
+    "reasons": explanations
+   }
 
 
 # Ejecución de prueba
 with Session(engine) as session:
-    exp = explain_student(session, student_id=1001, top_k=1)
+    exp = explain_student(session, student_id=1080, top_k=5)
     print(exp)
+
