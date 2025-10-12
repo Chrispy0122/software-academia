@@ -4,7 +4,7 @@ from sqlmodel import Session
 
 app = FastAPI(title="Churn Scoring API", version="1.0.0")
 
-app.get("/health")
+@app.get("/health")
 def health():
     return {"status": "ok"}
 
@@ -35,103 +35,15 @@ _num_cols = _bundle.get("numeric_cols", [])
 
 from sqlalchemy import text
 import pandas as pd
-
-def df_from_sql(session: Session, sql: str, params: dict | None = None) -> pd.DataFrame:
-    stmt = text(sql)
-    if params: stmt = stmt.bindparams(**params)
-    rows = session.exec(stmt).mappings().all()
-    return pd.DataFrame(rows)
-
-def infer_asof_date(session: Session) -> str:
-    att = df_from_sql(session, "SELECT MAX(Class_Date) AS max_att FROM attendance")
-    pay = df_from_sql(session, "SELECT MAX(Payment_Date) AS max_pay FROM payments")
-    max_att = pd.to_datetime(att["max_att"].iloc[0], errors="coerce") if not att.empty else pd.NaT
-    max_pay = pd.to_datetime(pay["max_pay"].iloc[0], errors="coerce") if not pay.empty else pd.NaT
-    asof = max(max_att, max_pay)
-    if pd.isna(asof):
-        raise HTTPException(status_code=500, detail="No hay fechas en attendance/payments")
-    return asof.strftime("%Y-%m-%d")
-
-def build_features_from_db(session: Session, asof_date: str) -> pd.DataFrame:
-    asof = pd.to_datetime(asof_date); cutoff = asof - pd.Timedelta(days=1); cutoff_s = cutoff.strftime("%Y-%m-%d")
-    students = df_from_sql(session, "SELECT Student_ID, Signup_Date, Plan, Price_USD FROM students")
-    if students.empty: raise HTTPException(status_code=500, detail="Tabla students vacía")
-    students["Signup_Date"] = pd.to_datetime(students["Signup_Date"], errors="coerce")
-    students["tenure_days"] = (cutoff - students["Signup_Date"]).dt.days.clip(lower=0)
-    students["plan"] = students["Plan"].astype(str)
-    students["price_usd"] = pd.to_numeric(students["Price_USD"], errors="coerce").fillna(0)
-
-    att_sql = """
-    WITH hist AS (
-      SELECT Student_ID, Class_Date, COALESCE(Present, 1) AS Present
-      FROM attendance
-      WHERE Class_Date <= :cutoff
-    ),
-    last_att AS (SELECT Student_ID, MAX(Class_Date) AS last_class FROM hist GROUP BY Student_ID),
-    win30 AS (SELECT Student_ID, SUM(Present) AS total_classes_30d FROM hist
-              WHERE Class_Date BETWEEN DATE_SUB(:cutoff, INTERVAL 29 DAY) AND :cutoff GROUP BY Student_ID),
-    win60 AS (SELECT Student_ID, SUM(Present) AS total_classes_60d FROM hist
-              WHERE Class_Date BETWEEN DATE_SUB(:cutoff, INTERVAL 59 DAY) AND :cutoff GROUP BY Student_ID),
-    win90 AS (SELECT Student_ID, SUM(Present) AS total_classes_90d FROM hist
-              WHERE Class_Date BETWEEN DATE_SUB(:cutoff, INTERVAL 89 DAY) AND :cutoff GROUP BY Student_ID)
-    SELECT s.Student_ID, last_att.last_class,
-           COALESCE(win30.total_classes_30d,0) AS total_classes_30d,
-           COALESCE(win60.total_classes_60d,0) AS total_classes_60d,
-           COALESCE(win90.total_classes_90d,0) AS total_classes_90d
-    FROM (SELECT DISTINCT Student_ID FROM students) s
-    LEFT JOIN last_att ON s.Student_ID = last_att.Student_ID
-    LEFT JOIN win30    ON s.Student_ID = win30.Student_ID
-    LEFT JOIN win60    ON s.Student_ID = win60.Student_ID
-    LEFT JOIN win90    ON s.Student_ID = win90.Student_ID
-    """
-    attendance_agg = df_from_sql(session, att_sql, {"cutoff": cutoff_s})
-
-    pay_sql = """
-    WITH pay AS (
-      SELECT Student_ID, Payment_Date, Amount, Status, Payment_ID
-      FROM payments
-      WHERE Payment_Date <= :cutoff
-    ),
-    ok AS (
-      SELECT * FROM pay
-      WHERE COALESCE(LOWER(Status), 'paid') IN ('completed','paid','success','approved','ok')
-    ),
-    last_pay AS (SELECT Student_ID, MAX(Payment_Date) AS last_payment FROM ok GROUP BY Student_ID),
-    win90 AS (
-      SELECT Student_ID, SUM(Amount) AS payments_90d_usd, COUNT(Payment_ID) AS n_payments_90d
-      FROM ok
-      WHERE Payment_Date BETWEEN DATE_SUB(:cutoff, INTERVAL 89 DAY) AND :cutoff
-      GROUP BY Student_ID
-    )
-    SELECT s.Student_ID, last_pay.last_payment,
-           COALESCE(win90.payments_90d_usd,0) AS payments_90d_usd,
-           COALESCE(win90.n_payments_90d,0)  AS n_payments_90d
-    FROM (SELECT DISTINCT Student_ID FROM students) s
-    LEFT JOIN last_pay ON s.Student_ID = last_pay.Student_ID
-    LEFT JOIN win90    ON s.Student_ID = win90.Student_ID
-    """
-    payments_agg = df_from_sql(session, pay_sql, {"cutoff": cutoff_s})
-
-    out = students.merge(attendance_agg, on="Student_ID", how="left").merge(payments_agg, on="Student_ID", how="left")
-    out["last_class"] = pd.to_datetime(out["last_class"], errors="coerce")
-    out["days_since_last_attendance"] = (cutoff - out["last_class"]).dt.days
-    out["days_since_last_attendance"] = out["days_since_last_attendance"].fillna(9999).astype(int)
-    out["last_payment"] = pd.to_datetime(out["last_payment"], errors="coerce")
-    out["months_since_last_payment"] = ((cutoff - out["last_payment"]).dt.days / 30.0).fillna(9999.0)
-
-    keep = ["Student_ID","plan","price_usd","tenure_days",
-            "days_since_last_attendance","total_classes_30d","total_classes_60d","total_classes_90d",
-            "months_since_last_payment","payments_90d_usd","n_payments_90d"]
-    out = out[keep].fillna(0)
-    out["plan"] = out["plan"].astype(str)
-    return out
+from software_academia.ml.src.scoring import pipe as _pipe, expected as _expected, cat_cols as _cat_cols, num_cols as _num_cols
+from software_academia.ml.src.feature_builder import build_features_from_db_sqlmodel_session, infer_asof_date, df_from_sql
 
 def score_one_student(session: Session, student_id: int, asof_date: str | None = None) -> float:
     # 1) fecha de corte
     if asof_date is None:
         asof_date = infer_asof_date(session)
     # 2) features
-    feat = build_features_from_db(session, asof_date)
+    feat = build_features_from_db_sqlmodel_session(session, asof_date)
     row = feat.loc[feat["Student_ID"] == student_id].copy()
     if row.empty:
         raise HTTPException(status_code=404, detail=f"Student_ID {student_id} no encontrado")

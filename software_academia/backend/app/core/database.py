@@ -42,9 +42,9 @@ with Session(engine) as s:
     r = s.exec(text("""
         SELECT COUNT(*) AS cantidad_1
         FROM `churn_training_unified`
-        WHERE CAST(`abndono` AS UNSIGNED) = 1
+        WHERE CAST(`abandono` AS UNSIGNED) = 1
     """))
-    print("abndono = 1 ->", r.scalar())
+    print("abandono = 1 ->", r.scalar())
 with Session(engine) as s:
     cols_students = s.exec(text("""
         SELECT COLUMN_NAME, DATA_TYPE
