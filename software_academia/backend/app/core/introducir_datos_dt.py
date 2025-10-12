@@ -5,8 +5,8 @@ import sys
 import datetime as dt
 import mysql.connector
 
-# ===================== CONFIG =====================
-DB_NAME    = "Ingles_academia"
+# ===================== CONFIG (con fallback) =====================
+DEFAULT_DB_NAME = "Ingles_academia"
 BATCH_SIZE = 2000
 
 # Rutas ABSOLUTAS (6 archivos)
@@ -15,14 +15,15 @@ CSV_TEACHERS   = r"C:/Users/Windows/Downloads/synthetic_teachers.csv"
 CSV_PAYMENTS   = r"C:/Users/Windows/Downloads/synthetic_payments.csv"
 CSV_ATTENDANCE = r"C:/Users/Windows/Downloads/synthetic_attendance.csv"
 CSV_EMAILS     = r"C:/Users/Windows/Downloads/synthetic_emails.csv"
-CSV_CHURN      = r"C:/Users/Windows/Downloads/churn_training_unified.csv"
+CSV_CHURN      = r"C:/Users/Windows/Downloads/training_panel_template.csv"  # tu panel/plantilla
 
+# Variables de entorno (con valores por defecto si no están seteadas)
 MYSQL_HOST = os.getenv("DB_HOST")
 MYSQL_USER = os.getenv("DB_USER")
 MYSQL_PASS = os.getenv("DB_PASSWORD")
-MYSQL_PORT = int(os.getenv("DB_PORT", "3306"))
+MYSQL_PORT = os.getenv("DB_PORT")
 DB_NAME    = os.getenv("DB_NAME")
-# ==================================================
+# ================================================================
 
 def qi(name: str) -> str:
     return "`" + str(name).replace("`", "``") + "`"
@@ -70,11 +71,13 @@ def clean_money_like(s):
 
 def guess_type(colname, sample_vals):
     lower = colname.lower()
-    if lower.endswith("_id") and lower != "email_id":
+    # Heurísticas por nombre
+    if lower.endswith("_id") or lower == "id" or lower in {"student_id","teacher_id","payment_id","attendance_id","email_id"}:
         return ("BIGINT", "int")
-    if any(k in lower for k in ("amount","price","usd","monto")):
+    if any(k in lower for k in ("amount","price","usd","monto","importe","sum_","avg_")):
         return ("DECIMAL(10,2)", "float")
-    if "date" in lower:
+    if "date" in lower or "fecha" in lower or lower.endswith("_at"):
+        # prefer DATETIME si vemos horas
         for v in sample_vals:
             if v is None: continue
             if parse_datetime(v): return ("DATETIME", "datetime")
@@ -128,7 +131,7 @@ def convert_value(py_label, raw):
     if py_label == "datetime":
         d = parse_datetime(s)
         return d.strftime("%Y-%m-%d %H:%M:%S") if d else None
-    return s
+    return s  # texto
 
 # ------------------- MySQL helpers -------------------
 def connect_mysql():
@@ -144,7 +147,7 @@ def ensure_database(cur):
 def drop_if_exists(cur, tname):
     cur.execute(f"DROP TABLE IF EXISTS {qi(tname)};")
 
-# === versión con PK obligatoria (Aiven: sql_require_primary_key=ON) ===
+# === versión con PK obligatoria (si no hay, se crea _row_id) ===
 def create_table_from_csv(cur, table_name, header, sample_rows, all_rows_for_pk):
     # Inferir tipos
     col_types, py_labels = {}, {}
@@ -154,14 +157,20 @@ def create_table_from_csv(cur, table_name, header, sample_rows, all_rows_for_pk)
         col_types[col] = sqlt
         py_labels[col] = pyl
 
-    # Candidata a PK
+    # Detectar candidata a PK (flexible, case-insensitive)
     pk_col = None
-    for candidate in ("Student_ID","Teacher_ID","Payment_ID","Attendance_ID","Email_ID"):
-        if candidate in header:
-            pk_col = candidate
-            break
+    candidates_by_name = ["student_id","teacher_id","payment_id","attendance_id","email_id","id"]
+    header_lower_map = {c.lower(): c for c in header}
+    for cand in candidates_by_name:
+        if cand in header_lower_map:
+            pk_col = header_lower_map[cand]; break
+    if pk_col is None:
+        # última opción: cualquier columna que termine en _id
+        for c in header:
+            if c.lower().endswith("_id"):
+                pk_col = c; break
 
-    # ¿Sirve como PK?
+    # Verificar unicidad para usar como PK
     use_primary = False
     add_unique  = False
     if pk_col:
@@ -218,21 +227,26 @@ def bulk_insert(cur, table_name, header, py_labels, rows_iter):
     return total
 
 def read_csv(path, sample_limit=500):
-    with open(path, "r", newline="", encoding="utf-8") as fh:
-        rdr = csv.DictReader(fh)
-        header = rdr.fieldnames or []
-        sample_rows, rows = [], []
-        for i, row in enumerate(rdr):
-            if i < sample_limit: sample_rows.append(row)
-            rows.append(row)
-    return header, sample_rows, rows
+    # intentamos utf-8-sig y luego latin-1
+    for enc in ("utf-8-sig","utf-8","latin-1"):
+        try:
+            with open(path, "r", newline="", encoding=enc) as fh:
+                rdr = csv.DictReader(fh)
+                header = rdr.fieldnames or []
+                sample_rows, rows = [], []
+                for i, row in enumerate(rdr):
+                    if i < sample_limit: sample_rows.append(row)
+                    rows.append(row)
+            return header, sample_rows, rows
+        except Exception:
+            continue
+    raise RuntimeError(f"No pude leer el CSV: {path}")
 
 def add_fk_if_possible(cur, child_table, child_col, parent_table, parent_col, on_delete="RESTRICT"):
     cur.execute(f"SHOW COLUMNS FROM {qi(child_table)} LIKE %s;", (child_col,))
     if not cur.fetchall(): return
     cur.execute(f"SHOW COLUMNS FROM {qi(parent_table)} LIKE %s;", (parent_col,))
     if not cur.fetchall(): return
-    # (MySQL 8 no soporta "CREATE INDEX IF NOT EXISTS" estándar; intentamos y si existe, falla y seguimos)
     try:
         cur.execute(f"CREATE INDEX {qi('idx_'+child_table+'_'+child_col)} ON {qi(child_table)}({qi(child_col)});")
     except Exception:
@@ -259,41 +273,45 @@ def build_table_from_file(cur, path, logical_name):
     return inserted
 
 def main():
+    print(f"[CFG] Host={MYSQL_HOST} User={MYSQL_USER} Port={MYSQL_PORT} DB={DB_NAME}")
     cnx = connect_mysql()
     cur = cnx.cursor()
     ensure_database(cur)
 
-    # Base
+    # Tablas base
     build_table_from_file(cur, CSV_STUDENTS,   "students")
     build_table_from_file(cur, CSV_TEACHERS,   "teachers")
     cnx.commit()
 
-    # Dependientes + churn
+    # Dependientes + churn/panel
     build_table_from_file(cur, CSV_PAYMENTS,   "payments")
     build_table_from_file(cur, CSV_ATTENDANCE, "attendance")
     build_table_from_file(cur, CSV_EMAILS,     "emails")
-    build_table_from_file(cur, CSV_CHURN,      "churn_training_unified")
+    build_table_from_file(cur, CSV_CHURN,      "training_panel")  # nombre lógico más claro
     cnx.commit()
 
-    # FKs opcionales (si existen columnas)
-    add_fk_if_possible(cur, "payments",   "Student_ID", "students", "Student_ID", on_delete="RESTRICT")
-    add_fk_if_possible(cur, "attendance", "Student_ID", "students", "Student_ID", on_delete="SET NULL")
-    add_fk_if_possible(cur, "emails",     "Student_ID", "students", "Student_ID", on_delete="SET NULL")
-    # (churn no enlaza por defecto)
+    # FKs (si existen columnas compatibles)
+    # Nota: intenta con minísculas por defecto; ajusta si tus CSV usan otra convención
+    add_fk_if_possible(cur, "payments",   "student_id", "students", "student_id", on_delete="RESTRICT")
+    add_fk_if_possible(cur, "attendance", "student_id", "students", "student_id", on_delete="SET NULL")
+    add_fk_if_possible(cur, "emails",     "student_id", "students", "student_id", on_delete="SET NULL")
 
     cnx.commit()
 
-    for t in ["students","teachers","payments","attendance","emails","churn_training_unified"]:
+    for t in ["students","teachers","payments","attendance","emails","training_panel"]:
         try:
             cur.execute(f"SELECT COUNT(*) FROM {qi(t)};")
             print(f" - {t}: {cur.fetchone()[0]} filas")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f" - {t}: (no se pudo contar) {e}")
 
     cur.close()
     cnx.close()
-    print("✅ Listo: 6 tablas creadas 1:1 con sus CSV y con PK garantizada.")
-    
+    print("✅ Listo: tablas creadas 1:1 con sus CSV, PK garantizada y upsert activo.")
+
 if __name__ == "__main__":
-    # sin DATA_DIR; no tomamos argumentos
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("[FATAL]", e)
+        sys.exit(1)
