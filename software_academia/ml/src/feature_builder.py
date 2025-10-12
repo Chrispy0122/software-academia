@@ -11,13 +11,16 @@ from sqlmodel import Session
 # ---------------------------
 # 1) Utilidad: leer a DataFrame
 # ---------------------------
+
 def df_from_sql(session: Session, sql: str, params: dict | None = None) -> pd.DataFrame:
-    """
-    Ejecuta SQL con Session y devuelve DataFrame con columnas nombradas.
-    """
-    res = session.exec(text(sql), params or {})
-    rows = res.mappings().all()  # dict-like rows
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+    stmt = text(sql)
+    if params:
+        stmt = stmt.bindparams(**params)   # ✅ kwargs
+    res = session.exec(stmt)               # ✅ un solo argumento
+    rows = res.mappings().all()
+    return pd.DataFrame(rows)
+
+
 
 # ---------------------------
 # 2) Inferir asof_date desde la BD
@@ -74,43 +77,43 @@ def build_features_from_db_sqlmodel_session(
     # --- ATTENDANCE agregada en SQL (última clase y ventanas 30/60/90) ---
     attendance_agg = df_from_sql(session, f"""
         WITH hist AS (
-          SELECT Student_ID, Class_Date, COALESCE(Present, 1) AS Present
-          FROM {T(attendance_table)}
-          WHERE Class_Date <= :cutoff
+         SELECT Student_ID, Class_Date, COALESCE(Present, 1) AS Present
+         FROM attendance
+         WHERE Class_Date <= :cutoff
         ),
         last_att AS (
-          SELECT Student_ID, MAX(Class_Date) AS last_class
-          FROM hist GROUP BY Student_ID
+            SELECT Student_ID, MAX(Class_Date) AS last_class
+            FROM hist GROUP BY Student_ID
         ),
         win30 AS (
-          SELECT Student_ID, SUM(Present) AS classes_30d
-          FROM hist
-          WHERE Class_Date BETWEEN DATE_SUB(:cutoff, INTERVAL 29 DAY) AND :cutoff
-          GROUP BY Student_ID
-        ),
+            SELECT Student_ID, SUM(Present) AS classes_30d
+            FROM hist
+            WHERE Class_Date BETWEEN DATE_SUB(:cutoff, INTERVAL 29 DAY) AND :cutoff
+            GROUP BY Student_ID
+         ),
         win60 AS (
-          SELECT Student_ID, SUM(Present) AS classes_60d
-          FROM hist
-          WHERE Class_Date BETWEEN DATE_SUB(:cutoff, INTERVAL 59 DAY) AND :cutoff
-          GROUP BY Student_ID
+            SELECT Student_ID, SUM(Present) AS classes_60d
+            FROM hist
+            WHERE Class_Date BETWEEN DATE_SUB(:cutoff, INTERVAL 59 DAY) AND :cutoff
+            GROUP BY Student_ID
         ),
         win90 AS (
-          SELECT Student_ID, SUM(Present) AS classes_90d
-          FROM hist
-          WHERE Class_Date BETWEEN DATE_SUB(:cutoff, INTERVAL 89 DAY) AND :cutoff
-          GROUP BY Student_ID
+            SELECT Student_ID, SUM(Present) AS classes_90d
+            FROM hist
+            WHERE Class_Date BETWEEN DATE_SUB(:cutoff, INTERVAL 89 DAY) AND :cutoff
+            GROUP BY Student_ID
         )
         SELECT s.Student_ID,
                last_att.last_class,
-               COALESCE(win30.classes_30d,0) AS classes_30d,
-               COALESCE(win60.classes_60d,0) AS classes_60d,
-               COALESCE(win90.classes_90d,0) AS classes_90d
-        FROM (SELECT DISTINCT Student_ID FROM {T(students_table)}) s
+               COALESCE(win30.classes_30d,0) AS total_classes_30d,
+               COALESCE(win60.classes_60d,0) AS total_classes_60d,
+               COALESCE(win90.classes_90d,0) AS total_classes_90d
+        FROM (SELECT DISTINCT Student_ID FROM students) s
         LEFT JOIN last_att ON s.Student_ID = last_att.Student_ID
         LEFT JOIN win30    ON s.Student_ID = win30.Student_ID
         LEFT JOIN win60    ON s.Student_ID = win60.Student_ID
         LEFT JOIN win90    ON s.Student_ID = win90.Student_ID
-    """, {"cutoff": cutoff_s})
+         """, {"cutoff": cutoff_s})
 
     # --- PAYMENTS agregada en SQL (último pago y 90d) ---
     payments_agg = df_from_sql(session, f"""
@@ -157,10 +160,11 @@ def build_features_from_db_sqlmodel_session(
 
     # Selección final (mismo contrato de features que tu modelo espera)
     keep = [
-        "Student_ID","plan","price_usd","tenure_days",
-        "days_since_last_attendance","classes_30d","classes_60d","classes_90d",
-        "months_since_last_payment","payments_90d_usd","n_payments_90d"
-    ]
+    "Student_ID","plan","price_usd","tenure_days",
+    "days_since_last_attendance","total_classes_30d","total_classes_60d","total_classes_90d",
+    "months_since_last_payment","payments_90d_usd","n_payments_90d"
+     ]
+
     out = out[keep].fillna(0)
     out["plan"] = out["plan"].astype(str)
     return out
