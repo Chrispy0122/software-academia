@@ -20,15 +20,6 @@ from datetime import datetime
 from typing import List, Dict, Tuple, Any
 import mysql.connector
 
-# ========= CONFIG =========
-MYSQL_CFG = {
-    "host": "mysql-senu-jhonnybarrios968.b.aivencloud.com",              # p.ej. "mysql-senu-jhonnybarrios968.b.aivencloud.com"
-    "port": 15797,                     # p.ej. 15797
-    "user": "avnadmin",              # p.ej. "avnadmin"
-    "password": "***REDACTED***",
-    "database": "Ingles_academia",      # p.ej. "Ingles_academia"
-    "autocommit": False,
-}
 
 # Si quieres forzar reconstrucción de tablas (DROP & CREATE)
 DROP_AND_RECREATE = False
