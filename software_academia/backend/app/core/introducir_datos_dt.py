@@ -1,317 +1,350 @@
-import csv
-import re
+# -*- coding: utf-8 -*-
+"""
+Carga múltiples CSV a MySQL usando mysql.connector.
+- Infiero esquema (INT / DECIMAL / DATETIME / DATE / TINYINT / VARCHAR/TEXT).
+- Creo tabla si no existe (opcional: DROP & CREATE).
+- Inserto en lotes con transacciones.
+
+Requisitos:
+  pip install mysql-connector-python
+
+Ejecución:
+  python load_csvs_to_mysql.py
+"""
+
 import os
-import sys
-import datetime as dt
+import csv
+import math
+import decimal
+from datetime import datetime
+from typing import List, Dict, Tuple, Any
 import mysql.connector
 
-# ===================== CONFIG (con fallback) =====================
-DEFAULT_DB_NAME = "Ingles_academia"
-BATCH_SIZE = 2000
+# ========= CONFIG =========
+MYSQL_CFG = {
+    "host": "mysql-senu-jhonnybarrios968.b.aivencloud.com",              # p.ej. "mysql-senu-jhonnybarrios968.b.aivencloud.com"
+    "port": 15797,                     # p.ej. 15797
+    "user": "avnadmin",              # p.ej. "avnadmin"
+    "password": "***REDACTED***",
+    "database": "Ingles_academia",      # p.ej. "Ingles_academia"
+    "autocommit": False,
+}
 
-# Rutas ABSOLUTAS (6 archivos)
-CSV_STUDENTS   = r"C:/Users/Windows/Downloads/synthetic_students.csv"
-CSV_TEACHERS   = r"C:/Users/Windows/Downloads/synthetic_teachers.csv"
-CSV_PAYMENTS   = r"C:/Users/Windows/Downloads/synthetic_payments.csv"
-CSV_ATTENDANCE = r"C:/Users/Windows/Downloads/synthetic_attendance.csv"
-CSV_EMAILS     = r"C:/Users/Windows/Downloads/synthetic_emails.csv"
-CSV_CHURN      = r"C:/Users/Windows/Downloads/training_panel_template.csv"  # tu panel/plantilla
+# Si quieres forzar reconstrucción de tablas (DROP & CREATE)
+DROP_AND_RECREATE = False
 
-# Variables de entorno (con valores por defecto si no están seteadas)
-MYSQL_HOST = os.getenv("DB_HOST")
-MYSQL_USER = os.getenv("DB_USER")
-MYSQL_PASS = os.getenv("DB_PASSWORD")
-MYSQL_PORT = os.getenv("DB_PORT")
-DB_NAME    = os.getenv("DB_NAME")
-# ================================================================
+# Tamaño de lote de inserción
+BATCH_SIZE = 1000
 
-def qi(name: str) -> str:
-    return "`" + str(name).replace("`", "``") + "`"
+# Archivos -> tablas
+FILES_AND_TABLES: List[Tuple[str, str]] = [
+    (r"C:/Users/Windows/Downloads/synthetic_students.csv",     "students"),
+    (r"C:/Users/Windows/Downloads/synthetic_teachers.csv",     "teachers"),
+    (r"C:/Users/Windows/Downloads/synthetic_payments.csv",     "payments"),
+    (r"C:/Users/Windows/Downloads/synthetic_attendance.csv",   "attendance"),
+    (r"C:/Users/Windows/Downloads/synthetic_emails.csv",       "emails"),
+    (r"C:/Users/Windows/Downloads/churn_training_unified.csv", "churn_training_unified"),
+]
 
-# ------------------- Parsers & type guess -------------------
-NULLS = {"", "na", "n/a", "null", "none", "nan", "nil"}
+# ========= UTIL: detección tipos =========
 
-DATE_FMTS = ("%Y-%m-%d","%d/%m/%Y","%m/%d/%Y","%Y/%m/%d","%d-%m-%Y")
-DT_FMTS   = ("%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M","%d/%m/%Y %H:%M:%S","%m/%d/%Y %H:%M:%S")
-
-def parse_date(s):
-    if s is None: return None
-    t = str(s).strip()
-    if t.lower() in NULLS: return None
+def try_parse_int(s: str) -> bool:
     try:
-        return dt.date.fromisoformat(t).isoformat()
-    except Exception:
-        for f in DATE_FMTS:
-            try: return dt.datetime.strptime(t, f).date().isoformat()
-            except Exception: pass
-    return None
+        int(s)
+        return True
+    except:
+        return False
 
-def parse_datetime(s):
-    if s is None: return None
-    t = str(s).strip()
-    if t.lower() in NULLS: return None
-    for f in DT_FMTS:
-        try: return dt.datetime.strptime(t, f)
-        except Exception: pass
+def try_parse_decimal(s: str) -> bool:
     try:
-        return dt.datetime.fromisoformat(t.replace("Z","+00:00")).replace(tzinfo=None)
-    except Exception:
-        return None
+        decimal.Decimal(s)
+        # Evitar tratar como decimal cosas tipo "00123" si ya es int
+        return not try_parse_int(s)
+    except:
+        return False
 
-def looks_int(s):   return re.fullmatch(r"[+-]?\d+", s) is not None
-def looks_float(s): return re.fullmatch(r"[+-]?\d+\.\d+", s) is not None
+# Fechas: probamos algunos formatos comunes; si ninguna, no es fecha
+DATE_FORMATS = [
+    "%Y-%m-%d",
+    "%d/%m/%Y",
+    "%m/%d/%Y",
+    "%Y/%m/%d",
+    "%d-%m-%Y",
+    "%m-%d-%Y",
+]
 
-def clean_money_like(s):
-    t = re.sub(r"[^\d,.\-]", "", s)
-    if t.count(",") > 0 and t.count(".") == 0:
-        t = t.replace(",", ".")
-    if t.count(".") > 1:
-        parts = t.split("."); t = "".join(parts[:-1]) + "." + parts[-1]
-    return t
+DATETIME_FORMATS = [
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
+    "%d/%m/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M:%S",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M",
+]
 
-def guess_type(colname, sample_vals):
-    lower = colname.lower()
-    # Heurísticas por nombre
-    if lower.endswith("_id") or lower == "id" or lower in {"student_id","teacher_id","payment_id","attendance_id","email_id"}:
-        return ("BIGINT", "int")
-    if any(k in lower for k in ("amount","price","usd","monto","importe","sum_","avg_")):
-        return ("DECIMAL(10,2)", "float")
-    if "date" in lower or "fecha" in lower or lower.endswith("_at"):
-        # prefer DATETIME si vemos horas
-        for v in sample_vals:
-            if v is None: continue
-            if parse_datetime(v): return ("DATETIME", "datetime")
-        return ("DATE", "date")
-    if lower.startswith("is_") or lower in {"present","active","isactive","is_active"}:
-        return ("TINYINT(1)", "bool")
-
-    has_text=False; has_float=False; has_int=True
-    maxlen = 0
-    for v in sample_vals:
-        if v is None: continue
-        s = str(v).strip()
-        if s.lower() in NULLS: continue
-        maxlen = max(maxlen, len(s))
-        if looks_int(s):
-            continue
-        elif looks_float(clean_money_like(s)):
-            has_float = True
-            has_int = False
-        elif parse_date(s) or parse_datetime(s):
-            has_text = True
-            has_int = False
-        else:
-            has_text = True
-            has_int = False
-    if not has_text and not has_float and has_int:
-        return ("BIGINT", "int")
-    if has_float and not has_text:
-        return ("DECIMAL(10,2)", "float")
-    if maxlen <= 255:   return ("VARCHAR(255)", "text")
-    if maxlen <= 1024:  return ("VARCHAR(1024)", "text")
-    return ("TEXT", "text")
-
-def convert_value(py_label, raw):
-    if raw is None: return None
-    s = str(raw).strip()
-    if s.lower() in NULLS: return None
-    if py_label == "int":
-        try: return int(s)
+def looks_date(s: str) -> bool:
+    for fmt in DATE_FORMATS:
+        try:
+            datetime.strptime(s, fmt)
+            return True
         except:
-            try: return int(float(clean_money_like(s)))
-            except: return None
-    if py_label == "float":
-        t = clean_money_like(s)
-        try: return float(t)
-        except: return None
-    if py_label == "bool":
-        return 1 if s.lower() in {"1","true","yes","y","si","sí"} else 0 if s.lower() in {"0","false","no","n"} else None
-    if py_label == "date":
-        return parse_date(s)
-    if py_label == "datetime":
-        d = parse_datetime(s)
-        return d.strftime("%Y-%m-%d %H:%M:%S") if d else None
-    return s  # texto
-
-# ------------------- MySQL helpers -------------------
-def connect_mysql():
-    return mysql.connector.connect(
-        host=MYSQL_HOST, user=MYSQL_USER, password=MYSQL_PASS, port=MYSQL_PORT,
-        charset="utf8mb4", use_unicode=True
-    )
-
-def ensure_database(cur):
-    cur.execute(f"CREATE DATABASE IF NOT EXISTS {qi(DB_NAME)} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
-    cur.execute(f"USE {qi(DB_NAME)};")
-
-def drop_if_exists(cur, tname):
-    cur.execute(f"DROP TABLE IF EXISTS {qi(tname)};")
-
-# === versión con PK obligatoria (si no hay, se crea _row_id) ===
-def create_table_from_csv(cur, table_name, header, sample_rows, all_rows_for_pk):
-    # Inferir tipos
-    col_types, py_labels = {}, {}
-    for col in header:
-        sample_vals = [r.get(col) for r in sample_rows]
-        sqlt, pyl = guess_type(col, sample_vals)
-        col_types[col] = sqlt
-        py_labels[col] = pyl
-
-    # Detectar candidata a PK (flexible, case-insensitive)
-    pk_col = None
-    candidates_by_name = ["student_id","teacher_id","payment_id","attendance_id","email_id","id"]
-    header_lower_map = {c.lower(): c for c in header}
-    for cand in candidates_by_name:
-        if cand in header_lower_map:
-            pk_col = header_lower_map[cand]; break
-    if pk_col is None:
-        # última opción: cualquier columna que termine en _id
-        for c in header:
-            if c.lower().endswith("_id"):
-                pk_col = c; break
-
-    # Verificar unicidad para usar como PK
-    use_primary = False
-    add_unique  = False
-    if pk_col:
-        seen, has_null, has_dup = set(), False, False
-        for r in all_rows_for_pk:
-            v = r.get(pk_col)
-            if v is None or str(v).strip()=="" or str(v).strip().lower() in NULLS:
-                has_null = True
-                continue
-            k = str(v).strip()
-            if k in seen: has_dup = True
-            else: seen.add(k)
-        if not has_null and not has_dup:
-            use_primary = True
-        else:
-            add_unique = True
-
-    cols_sql = []
-    add_surrogate_pk = not use_primary
-    if add_surrogate_pk:
-        cols_sql.append("`_row_id` BIGINT NOT NULL AUTO_INCREMENT")
-
-    for c in header:
-        nullability = "NOT NULL" if (use_primary and c == pk_col) else "NULL"
-        cols_sql.append(f"{qi(c)} {col_types[c]} {nullability}")
-
-    ddl = f"CREATE TABLE {qi(table_name)} (\n  " + ",\n  ".join(cols_sql)
-    ddl += f",\n  PRIMARY KEY ({qi(pk_col)})" if use_primary else f",\n  PRIMARY KEY (`_row_id`)"
-    ddl += f"\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
-    cur.execute(ddl)
-
-    if add_unique and pk_col:
-        try:
-            cur.execute(f"CREATE UNIQUE INDEX {qi('uniq_'+table_name+'_'+pk_col)} ON {qi(table_name)}({qi(pk_col)});")
-        except Exception:
             pass
+    return False
 
-    return py_labels
-
-def bulk_insert(cur, table_name, header, py_labels, rows_iter):
-    placeholders = ", ".join(["%s"] * len(header))
-    cols_sql = ", ".join(qi(c) for c in header)
-    sql = f"INSERT INTO {qi(table_name)} ({cols_sql}) VALUES ({placeholders}) " \
-          f"ON DUPLICATE KEY UPDATE " + ", ".join(f"{qi(c)}=VALUES({qi(c)})" for c in header)
-    batch, total = [], 0
-    pyl = [py_labels[c] for c in header]
-    for r in rows_iter:
-        conv = [convert_value(pyl[i], r.get(header[i])) for i in range(len(header))]
-        batch.append(conv)
-        if len(batch) >= BATCH_SIZE:
-            cur.executemany(sql, batch); total += len(batch); batch.clear()
-    if batch:
-        cur.executemany(sql, batch); total += len(batch)
-    return total
-
-def read_csv(path, sample_limit=500):
-    # intentamos utf-8-sig y luego latin-1
-    for enc in ("utf-8-sig","utf-8","latin-1"):
+def looks_datetime(s: str) -> bool:
+    # ISO-like rápido:
+    try:
+        # Esto cubre 2025-10-14T12:34:56, 2025-10-14 12:34:56, etc.
+        datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return True
+    except:
+        pass
+    for fmt in DATETIME_FORMATS:
         try:
-            with open(path, "r", newline="", encoding=enc) as fh:
-                rdr = csv.DictReader(fh)
-                header = rdr.fieldnames or []
-                sample_rows, rows = [], []
-                for i, row in enumerate(rdr):
-                    if i < sample_limit: sample_rows.append(row)
-                    rows.append(row)
-            return header, sample_rows, rows
-        except Exception:
+            datetime.strptime(s, fmt)
+            return True
+        except:
+            pass
+    return False
+
+def looks_bool(s: str) -> bool:
+    return s.lower() in {"true", "false", "0", "1", "yes", "no", "y", "n"}
+
+def normalize_bool(s: str) -> int:
+    return 1 if s.lower() in {"true", "1", "yes", "y"} else 0
+
+def infer_mysql_type(samples: List[str]) -> str:
+    """
+    Devuelve un tipo MySQL apropiado para una columna dado un muestreo de valores.
+    """
+    non_nulls = [x for x in samples if x is not None and x != ""]
+    if not non_nulls:
+        return "VARCHAR(255)"  # por defecto
+
+    # Si todos son boolean-like
+    if all(looks_bool(x) for x in non_nulls):
+        return "TINYINT(1)"
+
+    # Si todos son INT
+    if all(try_parse_int(x) for x in non_nulls):
+        # Elegimos BIGINT si hay números grandes
+        max_abs = max(abs(int(x)) for x in non_nulls)
+        if max_abs <= 2_147_483_647:
+            return "INT"
+        return "BIGINT"
+
+    # Si todos son DECIMAL/float
+    if all(try_parse_decimal(x) or try_parse_int(x) for x in non_nulls):
+        # Decimals: tamaño razonable
+        return "DECIMAL(18,6)"
+
+    # Si todos parecen DATETIME
+    if all(looks_datetime(x) for x in non_nulls):
+        return "DATETIME"
+
+    # Si todos parecen DATE
+    if all(looks_date(x) for x in non_nulls):
+        return "DATE"
+
+    # Si hay textos largos
+    maxlen = max(len(x) for x in non_nulls)
+    if maxlen > 1000:
+        return "LONGTEXT"
+    if maxlen > 255:
+        return "TEXT"
+
+    return "VARCHAR(255)"
+
+# ========= LECTURA CSV & ESQUEMA =========
+
+def read_csv_rows(path: str, limit_for_infer: int = 1000) -> Tuple[List[str], List[List[Any]]]:
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        headers = next(reader)
+        rows = []
+        for i, r in enumerate(reader):
+            rows.append(r)
+            if i + 1 >= limit_for_infer:
+                break
+    return headers, rows
+
+def full_csv_iterator(path: str):
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        headers = next(reader)
+        for r in reader:
+            yield r
+
+def build_schema_from_samples(headers: List[str], sample_rows: List[List[str]]) -> Dict[str, str]:
+    cols = {h: [] for h in headers}
+    for row in sample_rows:
+        for h, v in zip(headers, row):
+            v = v.strip()
+            cols[h].append(v if v != "" else None)
+
+    schema = {}
+    for h, samples in cols.items():
+        schema[h] = infer_mysql_type(samples)
+    return schema
+
+# ========= SQL helpers =========
+
+def quote_ident(ident: str) -> str:
+    return f"`{ident.replace('`', '``')}`"
+
+def make_create_table_sql(table: str, schema: Dict[str, str]) -> str:
+    cols_sql = []
+    for col, coltype in schema.items():
+        cols_sql.append(f"{quote_ident(col)} {coltype} NULL")
+    # Clave primaria artificial para no depender del CSV
+    cols_sql.append("`_row_id` BIGINT NOT NULL AUTO_INCREMENT")
+    cols_sql.append("PRIMARY KEY (`_row_id`)")
+    cols_clause = ",\n  ".join(cols_sql)
+    return f"CREATE TABLE {quote_ident(table)} (\n  {cols_clause}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;"
+
+def make_insert_sql(table: str, headers: List[str]) -> str:
+    cols = ", ".join(quote_ident(h) for h in headers)
+    placeholders = ", ".join(["%s"] * len(headers))
+    return f"INSERT INTO {quote_ident(table)} ({cols}) VALUES ({placeholders})"
+
+def coerce_row(values: List[str], headers: List[str], schema: Dict[str, str]) -> List[Any]:
+    out = []
+    for h, v in zip(headers, values):
+        v = None if v is None else v.strip()
+        if v == "":
+            v = None
+        coltype = schema[h].upper()
+
+        if v is None:
+            out.append(None)
             continue
-    raise RuntimeError(f"No pude leer el CSV: {path}")
 
-def add_fk_if_possible(cur, child_table, child_col, parent_table, parent_col, on_delete="RESTRICT"):
-    cur.execute(f"SHOW COLUMNS FROM {qi(child_table)} LIKE %s;", (child_col,))
-    if not cur.fetchall(): return
-    cur.execute(f"SHOW COLUMNS FROM {qi(parent_table)} LIKE %s;", (parent_col,))
-    if not cur.fetchall(): return
-    try:
-        cur.execute(f"CREATE INDEX {qi('idx_'+child_table+'_'+child_col)} ON {qi(child_table)}({qi(child_col)});")
-    except Exception:
-        pass
-    fk_name = f"fk_{child_table}_{child_col}_{parent_table}_{parent_col}"
-    try:
-        cur.execute(f"ALTER TABLE {qi(child_table)} ADD CONSTRAINT {qi(fk_name)} "
-                    f"FOREIGN KEY ({qi(child_col)}) REFERENCES {qi(parent_table)}({qi(parent_col)}) "
-                    f"ON DELETE {on_delete} ON UPDATE CASCADE;")
-    except Exception:
-        pass
+        try:
+            if coltype.startswith("TINYINT(1)") and looks_bool(v):
+                out.append(normalize_bool(v))
+            elif coltype == "INT":
+                out.append(int(v))
+            elif coltype == "BIGINT":
+                out.append(int(v))
+            elif coltype.startswith("DECIMAL"):
+                out.append(str(decimal.Decimal(v)))
+            elif coltype == "DATE":
+                # Normalizamos a YYYY-MM-DD si podemos
+                if looks_date(v):
+                    # intentamos varios formatos
+                    dt = None
+                    for fmt in DATE_FORMATS:
+                        try:
+                            dt = datetime.strptime(v, fmt).date()
+                            break
+                        except:
+                            pass
+                    out.append(dt.isoformat() if dt else v)
+                else:
+                    out.append(None)
+            elif coltype == "DATETIME":
+                # Normalizamos a 'YYYY-MM-DD HH:MM:SS'
+                if looks_datetime(v):
+                    try:
+                        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                    except:
+                        dt = None
+                        for fmt in DATETIME_FORMATS:
+                            try:
+                                dt = datetime.strptime(v, fmt)
+                                break
+                            except:
+                                pass
+                    out.append(dt.strftime("%Y-%m-%d %H:%M:%S") if dt else v)
+                else:
+                    out.append(None)
+            else:
+                out.append(v)
+        except:
+            # Si algo falla en la coerción, lo guardamos como texto
+            out.append(v)
+    return out
 
-# ------------------- Pipeline -------------------
-def build_table_from_file(cur, path, logical_name):
-    print(f"[INFO] {logical_name}: creando tabla igual al CSV…")
-    header, sample_rows, rows = read_csv(path)
-    if not header:
-        print(f"[WARN] {logical_name}: CSV sin encabezado. Saltado.")
-        return 0
-    drop_if_exists(cur, logical_name)
-    py_labels = create_table_from_csv(cur, logical_name, header, sample_rows, rows)
-    inserted = bulk_insert(cur, logical_name, header, py_labels, rows)
-    print(f"[OK] {logical_name}: {inserted} filas.")
-    return inserted
+# ========= MAIN PIPELINE =========
+
+def ensure_table(cursor, table: str, headers: List[str], schema: Dict[str, str]):
+    cursor.execute(f"SHOW TABLES LIKE %s", (table,))
+    exists = cursor.fetchone() is not None
+
+    if exists and DROP_AND_RECREATE:
+        print(f"[INFO] Dropping table {table} ...")
+        cursor.execute(f"DROP TABLE {quote_ident(table)}")
+        exists = False
+
+    if not exists:
+        # Crear tabla nueva
+        print(f"[INFO] Creating table {table} ...")
+        create_sql = make_create_table_sql(table, schema)
+        cursor.execute(create_sql)
+    else:
+        # Verificar columnas faltantes y agregarlas si no existen
+        cursor.execute(f"SHOW COLUMNS FROM {quote_ident(table)}")
+        existing_cols = {row[0] for row in cursor.fetchall()}  # set de nombres
+        to_add = [h for h in headers if h not in existing_cols]
+        for col in to_add:
+            coltype = schema[col]
+            alter = f"ALTER TABLE {quote_ident(table)} ADD COLUMN {quote_ident(col)} {coltype} NULL"
+            print(f"[INFO] Altering {table}: ADD COLUMN {col} {coltype}")
+            cursor.execute(alter)
+
+def insert_csv(conn, path: str, table: str):
+    print(f"\n[JOB] {os.path.basename(path)} -> {table}")
+
+    # 1) Muestra para inferir esquema
+    headers, sample_rows = read_csv_rows(path, limit_for_infer=1000)
+    schema = build_schema_from_samples(headers, sample_rows)
+
+    with conn.cursor() as cur:
+        ensure_table(cur, table, headers, schema)
+
+        insert_sql = make_insert_sql(table, headers)
+        batch = []
+        count = 0
+
+        for row in full_csv_iterator(path):
+            coerced = coerce_row(row, headers, schema)
+            batch.append(coerced)
+
+            if len(batch) >= BATCH_SIZE:
+                cur.executemany(insert_sql, batch)
+                count += len(batch)
+                batch.clear()
+                print(f"[INFO] Inserted {count} rows into {table} ...")
+
+        if batch:
+            cur.executemany(insert_sql, batch)
+            count += len(batch)
+
+        print(f"[OK] Total inserted into {table}: {count}")
+    conn.commit()
 
 def main():
-    print(f"[CFG] Host={MYSQL_HOST} User={MYSQL_USER} Port={MYSQL_PORT} DB={DB_NAME}")
-    cnx = connect_mysql()
-    cur = cnx.cursor()
-    ensure_database(cur)
+    # Conexión
+    print(f"[CFG] host={MYSQL_CFG['host']} user={MYSQL_CFG['user']} db={MYSQL_CFG['database']} port={MYSQL_CFG['port']}")
+    conn = mysql.connector.connect(
+        host=MYSQL_CFG["host"],
+        port=MYSQL_CFG["port"],
+        user=MYSQL_CFG["user"],
+        password=MYSQL_CFG["password"],
+        database=MYSQL_CFG["database"],
+        autocommit=MYSQL_CFG["autocommit"],
+    )
 
-    # Tablas base
-    build_table_from_file(cur, CSV_STUDENTS,   "students")
-    build_table_from_file(cur, CSV_TEACHERS,   "teachers")
-    cnx.commit()
-
-    # Dependientes + churn/panel
-    build_table_from_file(cur, CSV_PAYMENTS,   "payments")
-    build_table_from_file(cur, CSV_ATTENDANCE, "attendance")
-    build_table_from_file(cur, CSV_EMAILS,     "emails")
-    build_table_from_file(cur, CSV_CHURN,      "training_panel")  # nombre lógico más claro
-    cnx.commit()
-
-    # FKs (si existen columnas compatibles)
-    # Nota: intenta con minísculas por defecto; ajusta si tus CSV usan otra convención
-    add_fk_if_possible(cur, "payments",   "student_id", "students", "student_id", on_delete="RESTRICT")
-    add_fk_if_possible(cur, "attendance", "student_id", "students", "student_id", on_delete="SET NULL")
-    add_fk_if_possible(cur, "emails",     "student_id", "students", "student_id", on_delete="SET NULL")
-
-    cnx.commit()
-
-    for t in ["students","teachers","payments","attendance","emails","training_panel"]:
-        try:
-            cur.execute(f"SELECT COUNT(*) FROM {qi(t)};")
-            print(f" - {t}: {cur.fetchone()[0]} filas")
-        except Exception as e:
-            print(f" - {t}: (no se pudo contar) {e}")
-
-    cur.close()
-    cnx.close()
-    print("✅ Listo: tablas creadas 1:1 con sus CSV, PK garantizada y upsert activo.")
+    try:
+        for path, table in FILES_AND_TABLES:
+            if not os.path.exists(path):
+                print(f"[WARN] No existe el archivo: {path} (saltando)")
+                continue
+            insert_csv(conn, path, table)
+    finally:
+        conn.close()
+        print("\n[DONE] Ingesta finalizada.")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("[FATAL]", e)
-        sys.exit(1)
+    main()
