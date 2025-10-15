@@ -424,6 +424,6 @@ def explain_student(session, student_id: int, asof_date: str | None = None, top_
 
 # Ejecución de prueba
 with Session(engine) as session:
-    exp = explain_student(session, student_id=1080, top_k=5)
+    exp = explain_student(session, student_id=1020, top_k=5)
     print(exp)
 
