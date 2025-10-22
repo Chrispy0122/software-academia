@@ -1,1 +1,7 @@
 software-academia/.env
+
+__pycache__/
+
+*.pyc
+
+.env
