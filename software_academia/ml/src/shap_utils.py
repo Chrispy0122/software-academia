@@ -424,6 +424,108 @@ def explain_student(session, student_id: int, asof_date: str | None = None, top_
 
 # Ejecución de prueba
 with Session(engine) as session:
-    exp = explain_student(session, student_id=1020, top_k=5)
+    exp = explain_student(session, student_id=1001, top_k=5)
     print(exp)
 
+
+
+
+
+from __future__ import annotations
+from typing import List, Dict, Any, Iterable
+import json
+from datetime import datetime
+from pathlib import Path
+
+from software_academia.ml.automatizacion.config import SHAP_RESULTS_JSON, TOP_RISK_REASONS
+from software_academia.ml.src.shap_catalog import translate_feature_to_reason
+
+def _normalize_customer_record(raw: Dict[str, Any], top_k: int) -> Dict[str, Any]:
+    customer_id = raw.get("customer_id") or raw.get("student_id")
+    asof_date = raw.get("asof_date")
+    prob = float(raw.get("prob_churn", 0.0))
+
+    # Nos quedamos solo con razones que SUBEN el riesgo, ordenadas por impacto desc
+    reasons_raw: List[Dict[str, Any]] = raw.get("reasons", [])
+    risk_raisers = [r for r in reasons_raw if str(r.get("effect")).lower() == "sube_riesgo"]
+    risk_raisers.sort(key=lambda r: abs(float(r.get("impact", 0.0))), reverse=True)
+
+    # Tomamos top_k y construimos estructura uniforme
+    top_reasons = []
+    for r in risk_raisers[:top_k]:
+        feat = r.get("feature")
+        top_reasons.append({
+            "feature": feat,
+            "reason_human": translate_feature_to_reason(feat),
+            "impact": float(r.get("impact", 0.0)),
+            "value": r.get("value"),
+        })
+
+    return {
+        "customer_id": customer_id,
+        "asof_date": asof_date,
+        "prob_churn": prob,
+        "top_reasons": top_reasons,
+    }
+
+def build_shap_json_payload(records: Iterable[Dict[str, Any]], top_k: int = TOP_RISK_REASONS) -> List[Dict[str, Any]]:
+    """
+    Toma una lista/iterable de registros (como los que ya imprime tu shap_utils.py)
+    y devuelve una lista JSON normalizada lista para guardar.
+    """
+    output: List[Dict[str, Any]] = []
+    for raw in records:
+        try:
+            norm = _normalize_customer_record(raw, top_k=top_k)
+            # Validaciones básicas
+            if norm["customer_id"] is None:
+                continue
+            if not (0.0 <= norm["prob_churn"] <= 1.0):
+                continue
+            output.append(norm)
+        except Exception:
+            # En producción: loggear el error con el customer id si existe
+            continue
+    return output
+
+def save_shap_json(payload: List[Dict[str, Any]], path: Path = SHAP_RESULTS_JSON) -> Path:
+    """
+    Guarda el payload en disco como JSON, con indentado legible.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+
+
+# -------------------------------------------------------------------------
+# PUNTO DE ENTRADA DE EXPORTACIÓN (llámalo desde tu flujo actual)
+# -------------------------------------------------------------------------
+def export_shap_results_to_json(shap_records: Iterable[Dict[str, Any]], *, top_k: int = TOP_RISK_REASONS) -> Path:
+    """
+    API pública para tu pipeline:
+    1) Le pasas los registros ya calculados por tu lógica SHAP (prob + reasons)
+    2) Te devuelve la ruta del JSON estandarizado (/data/output/shap_results.json)
+    """
+    payload = build_shap_json_payload(shap_records, top_k=top_k)
+    return save_shap_json(payload, SHAP_RESULTS_JSON)
+
+# Ejemplo de uso (puedes quitarlo si ya tienes un caller):
+if __name__ == "__main__":
+    # Simulación mínima de un registro como el tuyo
+    sample = [{
+        'student_id': 1001,
+        'asof_date': '2025-10-31',
+        'top_k': 5,
+        'prob_churn': 0.5366243621,
+        'reasons': [
+            {'feature': 'plan', 'impact': -0.0174, 'effect': 'baja_riesgo', 'value': 'Standard'},
+            {'feature': 'payments_90d_usd', 'impact': 0.0174, 'effect': 'sube_riesgo', 'value': 147.0},
+            {'feature': 'days_since_last_attendance', 'impact': 0.0164, 'effect': 'sube_riesgo', 'value': 1},
+            {'feature': 'price_usd', 'impact': -0.0164, 'effect': 'baja_riesgo', 'value': 49.0},
+            {'feature': 'months_since_last_payment', 'impact': -0.0111, 'effect': 'baja_riesgo', 'value': 0.76}
+        ]
+    }]
+    out_path = export_shap_results_to_json(sample, top_k=3)
+    print(f"JSON exportado en: {out_path.resolve()}")

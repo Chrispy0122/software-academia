@@ -1,0 +1,21 @@
+[
+  {
+    "customer_id": 1001,
+    "asof_date": "2025-10-31",
+    "prob_churn": 0.5366243621,
+    "top_reasons": [
+      {
+        "feature": "payments_90d_usd",
+        "reason_human": "bajo_pago_reciente",
+        "impact": 0.0174,
+        "value": 147.0
+      },
+      {
+        "feature": "days_since_last_attendance",
+        "reason_human": "inactividad_reciente",
+        "impact": 0.0164,
+        "value": 1
+      }
+    ]
+  }
+]

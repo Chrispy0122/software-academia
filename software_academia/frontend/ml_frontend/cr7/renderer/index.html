@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:;"
+  />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Churn Prediction (IA)</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-icon">E</div>
+      </div>
+      <nav class="nav">
+        <a class="nav-item active">Dashboard</a>
+        <a class="nav-item">Estudiantes</a>
+        <a class="nav-item">Pagos</a>
+        <a class="nav-item">Churn IA</a>
+        <a class="nav-item">Automatizaciones</a>
+        <a class="nav-item">Reportes</a>
+        <a class="nav-item">Ajustes</a>
+      </nav>
+    </aside>
+
+    <!-- Main -->
+    <main class="main">
+      <!-- Header -->
+      <header class="header">
+        <h1>Churn Prediction (IA)</h1>
+        <div class="header-tools">
+          <button class="chip ghost">¿Cómo es calculado?</button>
+          <div class="user">
+            <span class="avatar">JA</span>
+          </div>
+        </div>
+      </header>
+
+      <!-- KPIs -->
+      <section class="kpi-grid">
+        <div class="card kpi">
+          <div class="kpi-icon kpi-green">🎓</div>
+          <div>
+            <div class="kpi-label">Students in high risk</div>
+            <div class="kpi-value" id="kpiHighRisk">18</div>
+            <div class="kpi-tags">
+              <span class="tag green">Revenue at risk</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card kpi">
+          <div class="kpi-icon kpi-red">💸</div>
+          <div>
+            <div class="kpi-label">Ingresos del mes</div>
+            <div class="kpi-value" id="kpiRevenue">$5,800</div>
+            <div class="kpi-tags">
+              <span class="tag red">Risk: AR / LTV / days</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card drivers">
+          <div class="drivers-head">
+            <h3>Top Drivers (Explainability)</h3>
+          </div>
+          <div class="drivers-list" id="driversList">
+            <!-- Se rellena por JS -->
+          </div>
+        </div>
+      </section>
+
+      <!-- Filtros -->
+      <section class="filters">
+        <button class="chip"><span>📘</span> Course</button>
+        <button class="chip"><span>⚖️</span> High/Medium/Low</button>
+        <button class="chip"><span>🗓️</span> Last 30/600 days</button>
+      </section>
+
+      <!-- Tabla Prioritized List -->
+      <section class="card table-card">
+        <div class="table-head">
+          <h3>Prioritized List</h3>
+          <div class="legend">
+            <span class="dot red"></span> High risk
+            <span class="dot yellow"></span> Medium
+            <span class="dot green"></span> Low
+          </div>
+        </div>
+
+        <div class="progress-list" id="progressList">
+          <!-- barras de score (JS) -->
+        </div>
+
+        <div class="table-wrap">
+          <table class="table" id="studentsTable">
+            <thead>
+              <tr>
+                <th>Alumno</th>
+                <th>Reasons</th>
+                <th>Pago</th>
+                <th>Last Payment</th>
+                <th>Estado</th>
+                <th>Próximo evento</th>
+                <th>Acciones</th>
+              </tr>
+            </thead>
+            <tbody><!-- JS rows --></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <!-- Drawer Plan of Action -->
+    <aside class="drawer" id="drawer">
+      <div class="drawer-header">
+        <h3>Plan of Action</h3>
+        <button id="drawerClose" class="icon-btn">✖</button>
+      </div>
+      <ol class="plan-list" id="planList">
+        <!-- JS plan -->
+      </ol>
+      <button class="btn-primary" id="suggestBtn">Suggest Plan</button>
+    </aside>
+  </div>
+
+  <script src="./data.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

@@ -180,3 +180,19 @@ with Session(engine) as session:
     asof = infer_asof_date(session)
     df_catalog = compute_global_shap_catalog(session, asof_date=asof, sample_size=300)
     print(df_catalog.head(15)[["orig_feature","global_sum_abs_shap","global_mean_abs_shap","rank"]])
+
+from typing import Dict
+
+SHAP_REASON_CATALOG: Dict[str, str] = {
+    "months_since_last_payment": "atraso_pago",
+    "payments_90d_usd": "bajo_pago_reciente",
+    "plan": "plan_inadecuado",
+    "price_usd": "precio_alto",
+    "total_classes_90d": "bajo_uso_3m",
+    "days_since_last_attendance": "inactividad_reciente",
+    "total_classes_60d": "bajo_uso_2m",
+    "total_classes_30d": "bajo_uso_1m",
+}
+
+def translate_feature_to_reason(feature_name: str) -> str:
+    return SHAP_REASON_CATALOG.get(feature_name, feature_name)

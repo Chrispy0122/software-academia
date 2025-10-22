@@ -1,0 +1,15 @@
+{
+  "name": "churn-dashboard-electron",
+  "version": "1.0.0",
+  "description": "Churn Prediction Dashboard (Electron + HTML/CSS/JS)",
+  "main": "src/main.js",
+  "author": "TuNombre",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^31.0.0"
+  }
+}
