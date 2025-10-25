@@ -26,7 +26,7 @@ TIER_MED  = float(os.getenv("TIER_MED", "0.40"))
 # Runtime
 # =========
 # ÚNICO flag global: si True NO enviamos correos reales ni llamamos a OpenAI real
-DRY_RUN   = os.getenv("DRY_RUN", "true").strip().lower() in ("1", "true", "yes", "y")
+DRY_RUN   = os.getenv("DRY_RUN", "False").strip().lower() in ("1", "true", "yes", "y")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # =========
@@ -41,12 +41,12 @@ OPENAI_MAX_RETRIES  = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
 # Gmail (solo ENVIAR correos)
 # =========
 # Cuenta remitente (la misma con la que harás OAuth)
-GMAIL_SENDER = os.getenv("GMAIL_SENDER", "tu_cuenta@tu_dominio.com")
+GMAIL_SENDER = os.getenv("GMAIL_SENDER", "christopherhernandez0122@gmail.com")
 
 # Rutas a credenciales OAuth de Google:
 # - credentials.json: secreto de cliente (descargado de Google Cloud Console)
 # - token.json: se genera en el primer login OAuth (y se reusa luego)
-GOOGLE_CREDENTIALS_PATH = Path(os.getenv("GOOGLE_CREDENTIALS_PATH", "./credentials.json"))
+GOOGLE_CREDENTIALS_PATH = Path(os.getenv("GOOGLE_CREDENTIALS_PATH", "C:/Users/Windows/Downloads/client_secret_754753279823-rg6qunlciv7tddsh4j9srofpo34h88h0.apps.googleusercontent.com.json"))
 GOOGLE_TOKEN_PATH       = Path(os.getenv("GOOGLE_TOKEN_PATH", "./token.json"))
 
 # Scope mínimo para ENVIAR correos
